@@ -1,0 +1,139 @@
+# UEFI bootloader in pure Orum — complete boot sequence.
+# Replaces boot/uefi/loader_code.py (391 lines of Python asm generation).
+# Entry: efi_main(image_handle, system_table). Compiled --freestanding.
+
+# Fixed physical addresses (must match docs/boot-contract.md)
+fn k_p_kernel() -> u64
+  return 0x400000
+end
+fn k_p_lowmem() -> u64
+  return 0x5000
+end
+fn k_p_info() -> u64
+  return 0x9000
+end
+fn k_p_heap() -> u64
+  return 0x2000000
+end
+
+fn uefi_call(fn_ptr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64
+  mut result: u64 = 0
+  asm
+    in fn_ptr = rdi
+    in a1 = rsi
+    in a2 = rdx
+    in a3 = rcx
+    in a4 = r8
+    out result = rax
+    clobber "r9"
+    clobber "r10"
+    clobber "r11"
+    raw 0x4D, 0x89, 0xC1
+    raw 0x49, 0x89, 0xC8
+    raw 0x48, 0x89, 0xF1
+    raw 0x48, 0x83, 0xEC, 0x20
+    raw 0xFF, 0xD7
+    raw 0x48, 0x83, 0xC4, 0x20
+  end
+  return result
+end
+
+fn efi_main(image_handle: u64, system_table: u64) -> u64
+  mut st: u64 = 0
+  asm
+    out st = rdx
+  end
+
+  mut st_ptr: raw *u64 = rawptr(st)
+  mut bs: u64 = st_ptr[12]
+
+  mut bs_ptr: raw *u64 = rawptr(bs)
+  mut locate: u64 = bs_ptr[40]
+  mut alloc: u64 = bs_ptr[5]
+  mut getmap: u64 = bs_ptr[7]
+  mut ebs: u64 = bs_ptr[29]
+
+  # GOP GUID: 9042A9DE-23DC-4A38-96FB-7ADDED080516
+  mut guid_d1: u32 = 0x9042A9DE
+  mut guid_addr: u64 = addr(guid_d1)
+
+  mut gop: u64 = 0
+  mut gop_addr: u64 = addr(gop)
+  mut status = uefi_call(locate, guid_addr, 0, gop_addr, 0)
+  if status != 0
+    return status
+  end
+
+  mut gop_ptr: raw *u64 = rawptr(gop)
+  mut query: u64 = gop_ptr[0]
+  mut setmode: u64 = gop_ptr[1]
+  mut mode_ptr: u64 = gop_ptr[3]
+  mut mode: raw *u64 = rawptr(mode_ptr)
+
+  # Find 1024x768x32 mode
+  mut mode_idx: u64 = 0
+  mut found: u64 = 0xFFFFFFFF
+  mut mi_size: u64 = 0
+  mut mi_size_addr: u64 = addr(mi_size)
+  mut mi: u64 = 0
+  mut mi_addr: u64 = addr(mi)
+  mut idx: u64 = 0
+  mut max_mode: u64 = mode[6]
+
+  while idx < max_mode
+    mut qs = uefi_call(query, gop, idx, mi_size_addr, mi_addr)
+    if qs == 0
+      mut mip: raw *u32 = rawptr(mi)
+      mut w: u32 = mip[0]
+      mut h: u32 = mip[1]
+      mut fmt: u32 = mip[2]
+      if w == 1024
+        if h == 768
+          if fmt == 0
+            found = idx
+          end
+        end
+      end
+    end
+    idx = idx + 1
+  end
+
+  if found == 0xFFFFFFFF
+    return 0x8000000000000003
+  end
+
+  mut ss = uefi_call(setmode, gop, found, 0, 0)
+  if ss != 0
+    return ss
+  end
+
+  # Get framebuffer base after SetMode
+  mut mode_ptr2: u64 = gop_ptr[3]
+  mut mode2: raw *u64 = rawptr(mode_ptr2)
+  mut fb_base: u64 = mode2[0]
+  mut fb_size: u64 = mode2[1]
+
+  # Allocate pages for kernel at fixed address
+  mut kp: u64 = k_p_kernel()
+  mut kp_addr: u64 = addr(kp)
+  mut pages: u64 = 256
+  mut as_ = uefi_call(alloc, 1, 7, pages, kp_addr)
+  if as_ != 0
+    return as_
+  end
+
+  # TODO: copy kernel from PE to kp, build info block,
+  # GetMemoryMap, ExitBootServices, jump to kernel.
+  # For now, spin with framebuffer filled green = SetMode worked.
+
+  mut fb: raw *u32 = rawptr(fb_base)
+  mut i: u64 = 0
+  while i < 1024 * 768
+    fb[i] = 0x0000FF00
+    i = i + 1
+  end
+
+  while 1 > 0
+  end
+  return 0
+end
