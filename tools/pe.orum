@@ -21,7 +21,7 @@
 # and call it; the top-level call below preserves the standalone
 # fixed-path behavior.
 
-take common from common
+take align_up, copy_bytes, rd16, rd32, rd64, read_all, wr16, wr32, wr64, zero_fill from common
 
 IMAGE_BASE = 0x200000
 SECT_ALIGN = 0x1000

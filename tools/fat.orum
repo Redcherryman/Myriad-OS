@@ -47,7 +47,7 @@
 # and call it; the top-level call below preserves the standalone
 # fixed-path behavior (128MB/16spc USB image).
 
-take common from common
+take copy_bytes, read_all, wr16, wr32, zero_fill from common
 
 SECT = 512
 TOTAL_MB = 128
