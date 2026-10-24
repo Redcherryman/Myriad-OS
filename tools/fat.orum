@@ -1,0 +1,323 @@
+# fat.orum — hosted Orum FAT16 disk-image writer (Menagerie build tool).
+#
+# Ports build_fat16() + the MBR half of build_uefi_disk() from
+# boot/uefi/pe_fat.py to Orum. Third step of making Menagerie-Kernel an
+# Orum-only repo (after pe.orum): the Python scaffolding in boot/ gets
+# replaced by hosted Orum tools living here in tools/. kernel/ stays
+# freestanding (no syscalls ever); tools/ is hosted and may use
+# fopen/fread/fwrite/fclose/fseek/heap_alloc.
+#
+# Interface (hosted Orum has no argv yet, so inputs/outputs are fixed):
+#   reads  in.efi        — the PE32+ UEFI application (BOOTX64.EFI)
+#   reads  in_readme.txt — optional; a missing file means no extra files.
+#                          When present it is stored as README  TXT in the
+#                          root directory, mirroring mkuefi.py's USB image
+#                          (extra_files=[("README  TXT", USB-README.md)]).
+#   writes out.img       — full partitioned disk image, byte-identical to
+#                          pe_fat.build_uefi_disk(efi_bytes, TOTAL_MB, SPC,
+#                          extra_files=[("README  TXT", readme)]).
+#
+# Disk layout (TOTAL_MB=128, SPC=16 — the USB image mkuefi.py ships):
+#   LBA 0:    MBR, one 0xEF partition starting at LBA 2048
+#   LBA 2048: FAT16 filesystem: BPB, 2 FATs, 512-entry root dir,
+#             cluster 2 = /EFI, cluster 3 = /EFI/BOOT/BOOTX64.EFI,
+#             then the extra root files.
+#
+# DESIGN NOTE — streaming, not whole-image: Orum v0.014's hosted heap is
+# a 1 MiB brk bump heap, so the 32/128 MiB image cannot be heap_alloc'd.
+# Instead the image is streamed sector by sector: every sector's content
+# is a pure function of the layout (computed up front) plus the input
+# files, so each 512-byte sector is built in a small buffer and written
+# immediately. Byte-identical to the Python version, which zeroes the
+# whole image first — here each sector buffer starts zeroed instead.
+#
+# The GPT half of build_uefi_disk() is deliberately NOT ported: Apple
+# firmware never picked up GPT sticks (confirmed dead end on the MacBook
+# Air), mkuefi.py never calls it, and it needs CRC32 (no zlib in hosted
+# Orum). The MBR path is the one that actually boots.
+#
+# NOTE on the 6-argument limit: Orum v0.014 allows at most 6 call
+# arguments, so the layout is split into small per-sector builders.
+# Module-level constants are not visible inside fn bodies, so
+# sizes/offsets are passed explicitly; the fixed FAT16 layout numbers
+# (reserved=32, root_sects=32, PART_LBA=2048) are baked as literals,
+# exactly like the Python version's locals.
+#
+# The main flow lives in fat_build() so build.orum can take this module
+# and call it; the top-level call below preserves the standalone
+# fixed-path behavior (128MB/16spc USB image).
+
+take common from common
+
+SECT = 512
+TOTAL_MB = 128
+SPC = 16
+PART_LBA = 2048
+
+IN_EFI = "in.efi"
+IN_README = "in_readme.txt"
+OUT_IMG = "out.img"
+
+# Write one 32-byte directory entry. The sector buffer starts zeroed,
+# so the reserved bytes are already correct.
+fn dent(img: raw *u8, dir_off: u64, name: raw *u8, attr: u64, cluster: u64, size: u64)
+copy_bytes(img, dir_off, name, 0, 11)
+img[dir_off + 11] = attr & 0xFF
+wr16(img, dir_off + 26, cluster)
+wr32(img, dir_off + 28, size)
+end
+
+# --- per-sector builders ---
+
+# LBA 0: MBR with one 0xEF partition. part_sects = sectors in it.
+fn sector_mbr(buf: raw *u8, part_sects: u64)
+buf[450] = 0xEF
+wr32(buf, 454, 2048)
+wr32(buf, 458, part_sects)
+wr16(buf, 510, 0xAA55)
+end
+
+# Filesystem sector 0: the BPB / boot sector.
+fn sector_bpb(buf: raw *u8, fat_sects: u64, fs_sects: u64, spc: u64, hidden: u64)
+buf[0] = 0xEB
+buf[1] = 0x3C
+buf[2] = 0x90
+oem: raw *u8 = [0x4D, 0x53, 0x44, 0x4F, 0x53, 0x35, 0x2E, 0x30]
+copy_bytes(buf, 3, oem, 0, 8)
+wr16(buf, 11, 512)
+buf[13] = spc & 0xFF
+wr16(buf, 14, 32)
+buf[16] = 2
+wr16(buf, 17, 512)
+wr16(buf, 21, 0xF8)
+wr16(buf, 22, fat_sects)
+wr16(buf, 24, 32)
+wr16(buf, 26, 64)
+wr32(buf, 32, fs_sects)
+wr32(buf, 28, hidden)
+buf[36] = 0x80
+buf[38] = 0x29
+wr32(buf, 39, 0x12345678)
+vlabel: raw *u8 = [0x4D, 0x45, 0x4E, 0x41, 0x47, 0x45, 0x52, 0x49, 0x45, 0x20, 0x20]
+copy_bytes(buf, 43, vlabel, 0, 11)
+fstype: raw *u8 = [0x46, 0x41, 0x54, 0x31, 0x36, 0x20, 0x20, 0x20]
+copy_bytes(buf, 54, fstype, 0, 8)
+wr16(buf, 510, 0xAA55)
+end
+
+# FAT entry value for cluster c, given the two file chains.
+# (efi always starts at cluster 4; the readme follows it.)
+fn fat_entry(c: u64, efi_start: u64, efi_n: u64, rd_start: u64, rd_n: u64) -> u64
+if c == 0
+return 0xFFF8
+end
+if c == 1
+return 0xFFFF
+end
+if c == 2
+return 0xFFFF
+end
+if c == 3
+return 0xFFFF
+end
+if c >= efi_start
+if c < efi_start + efi_n
+if c + 1 < efi_start + efi_n
+return c + 1
+end
+return 0xFFFF
+end
+end
+if c >= rd_start
+if c < rd_start + rd_n
+if c + 1 < rd_start + rd_n
+return c + 1
+end
+return 0xFFFF
+end
+end
+return 0
+end
+
+# One sector of a FAT copy: fat_idx is the 0-based sector within the copy.
+fn sector_fat(buf: raw *u8, fat_idx: u64, efi_start: u64, efi_n: u64, rd_start: u64, rd_n: u64)
+mut j: u64 = 0
+while j < 256
+c: u64 = fat_idx * 256 + j
+wr16(buf, j * 2, fat_entry(c, efi_start, efi_n, rd_start, rd_n))
+j = j + 1
+end
+end
+
+# One root-directory sector (16 entries): entry 0 = EFI subdir,
+# entry 1 = README.TXT when present.
+fn sector_root(buf: raw *u8, root_idx: u64, name_efi: raw *u8, name_readme: raw *u8, rd_start: u64, rd_len: u64)
+mut k: u64 = 0
+while k < 16
+e: u64 = root_idx * 16 + k
+off: u64 = k * 32
+if e == 0
+dent(buf, off, name_efi, 0x10, 2, 0)
+else
+if e == 1
+if rd_len > 0
+dent(buf, off, name_readme, 0x20, rd_start, rd_len)
+end
+end
+end
+k = k + 1
+end
+end
+
+# One sector of a file's data: file_off is the byte offset of this
+# sector within the file. Partial tail sectors stay zero-padded.
+fn sector_file(buf: raw *u8, file_off: u64, data: raw *u8, dlen: u64)
+if file_off < dlen
+mut n: u64 = 512
+rem: u64 = dlen - file_off
+if rem < n
+n = rem
+end
+copy_bytes(buf, 0, data, file_off, n)
+end
+end
+
+# --- main flow: stream the disk image sector by sector ---
+#
+# NOTE: module constants are NOT visible inside fn bodies, so the
+# layout numbers appear as literals below — they mirror the constants
+# above: SECT=512, PART_LBA=2048.
+
+fn fat_build(efi_path: str, readme_path: str, img_path: str, total_mb: u64, spc: u64)
+mut efi_len: u64 = 0
+efi_lenp: raw *u64 = rawptr(addr(efi_len))
+efi: raw *u8 = read_all(efi_path, efi_lenp)
+if efi_len == 0
+crash "cannot open efi input (or it is empty)"
+end
+
+mut readme_len: u64 = 0
+readme_lenp: raw *u64 = rawptr(addr(readme_len))
+readme: raw *u8 = read_all(readme_path, readme_lenp)
+
+total_sects: u64 = total_mb * 2048
+fs_sects: u64 = total_sects - 2048
+
+# FAT size iteration, exactly like pe_fat.build_fat16
+mut fat_sects: u64 = 1
+mut clusters: u64 = 0
+mut sized: u64 = 0
+while sized == 0
+data_secs: u64 = fs_sects - 32 - 2 * fat_sects - 32
+clusters = data_secs / spc
+need: u64 = (clusters * 2 + 512 - 1) / 512
+if need <= fat_sects
+sized = 1
+else
+fat_sects = need
+end
+end
+if clusters <= 4085
+crash "bad FAT16 cluster count (too few)"
+end
+if clusters > 65525
+crash "bad FAT16 cluster count (too many)"
+end
+
+clus_bytes: u64 = spc * 512
+fat_end: u64 = 32 + 2 * fat_sects
+root_end: u64 = fat_end + 32
+
+# File chains: cluster 2 = /EFI, 3 = /EFI/BOOT, files start at 4
+efi_start: u64 = 4
+efi_n: u64 = (efi_len + clus_bytes - 1) / clus_bytes
+rd_start: u64 = efi_start + efi_n
+mut rd_n: u64 = 0
+if readme_len > 0
+rd_n = (readme_len + clus_bytes - 1) / clus_bytes
+end
+
+# Prebuild the two directory clusters' first sectors (rest is zeros)
+name_boot: raw *u8 = [0x42, 0x4F, 0x4F, 0x54, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20]
+name_dotdot: raw *u8 = [0x2E, 0x2E, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20]
+name_bootx64: raw *u8 = [0x42, 0x4F, 0x4F, 0x54, 0x58, 0x36, 0x34, 0x20, 0x45, 0x46, 0x49]
+name_efi: raw *u8 = [0x45, 0x46, 0x49, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20]
+name_readme: raw *u8 = [0x52, 0x45, 0x41, 0x44, 0x4D, 0x45, 0x20, 0x20, 0x54, 0x58, 0x54]
+dir2: raw *u8 = heap_alloc(512)
+zero_fill(dir2, 0, 512)
+dent(dir2, 0, name_boot, 0x10, 3, 0)
+dent(dir2, 32, name_dotdot, 0x10, 0, 0)
+dir3: raw *u8 = heap_alloc(512)
+zero_fill(dir3, 0, 512)
+dent(dir3, 0, name_bootx64, 0x20, efi_start, efi_len)
+dent(dir3, 32, name_dotdot, 0x10, 2, 0)
+
+sec: raw *u8 = heap_alloc(512)
+ofd: int = fopen(img_path, "w")
+if ofd < 0
+crash "cannot open img output for writing"
+end
+
+mut s: u64 = 0
+while s < total_sects
+zero_fill(sec, 0, 512)
+if s == 0
+sector_mbr(sec, total_sects - 2048)
+else
+if s >= 2048
+fss: u64 = s - 2048
+if fss == 0
+sector_bpb(sec, fat_sects, fs_sects, spc, 2048)
+else
+if fss >= 32
+if fss < fat_end
+sector_fat(sec, (fss - 32) % fat_sects, efi_start, efi_n, rd_start, rd_n)
+else
+if fss < root_end
+sector_root(sec, fss - fat_end, name_efi, name_readme, rd_start, readme_len)
+else
+dss: u64 = fss - root_end
+c: u64 = dss / spc + 2
+k: u64 = dss % spc
+if c == 2
+if k == 0
+copy_bytes(sec, 0, dir2, 0, 512)
+end
+else
+if c == 3
+if k == 0
+copy_bytes(sec, 0, dir3, 0, 512)
+end
+else
+if c < efi_start + efi_n
+sector_file(sec, (c - efi_start) * clus_bytes + k * 512, efi, efi_len)
+else
+if c < rd_start + rd_n
+sector_file(sec, (c - rd_start) * clus_bytes + k * 512, readme, readme_len)
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+mut wp: u64 = 0
+while wp < 512
+w: int = fwrite(ofd, sec + wp, 512 - wp)
+if w <= 0
+crash "short write to img output"
+end
+wp = wp + w
+end
+s = s + 1
+end
+fclose(ofd)
+
+say(total_sects * 512)
+end
+
+# Standalone entry: fixed paths, USB image (unchanged behavior).
+fat_build(IN_EFI, IN_README, OUT_IMG, TOTAL_MB, SPC)

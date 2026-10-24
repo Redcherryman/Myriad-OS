@@ -1,0 +1,35 @@
+# build.orum — one-shot Myriad disk-image builder (Myriad build tool).
+#
+# Composes the pe.orum and fat.orum flows in a single process:
+#   in.elf (+ in_kern.elf / in_readme.txt)
+#     -> pe_build  -> mid.efi
+#     -> fat_build -> out.img
+#
+# The image is the 32MB / 8-sectors-per-cluster configuration — the
+# fastest byte-identical match for pe_fat.build_uefi_disk(efi, 32, 8)
+# (the QEMU test image mkuefi.py ships). No extra files: if
+# in_readme.txt is absent the image carries just /EFI/BOOT/BOOTX64.EFI.
+#
+# DESIGN NOTE — the `fn _start` trick: `take` is plain file inclusion,
+# so pe.orum's and fat.orum's standalone top-level calls WOULD run on
+# inclusion. But when the entry file defines `fn _start`, the compiler
+# jumps straight to it and never emits ANY top-level statements —
+# which is exactly the "imported files are declarations-only" behavior
+# we want. Standalone builds of pe.orum / fat.orum define no _start, so
+# their fixed-path top-level calls still run unchanged there.
+# _start must end with exit(0): the entry stub jumps (not calls) to it,
+# so returning would pop a garbage return address.
+#
+# Build with base_dir=tools so the takes resolve:
+#   compile_source(open("build.orum").read(), base_dir="tools")
+
+take pe_build from pe
+take fat_build from fat
+take lowmem_build from lowmem
+
+fn _start()
+lowmem_build("lowmem.bin")
+pe_build("in.elf", "in_kern.elf", "lowmem.bin", "mid.efi")
+fat_build("mid.efi", "in_readme.txt", "out.img", 32, 8)
+exit(0)
+end

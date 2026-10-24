@@ -1,139 +1,450 @@
-# UEFI bootloader in pure Orum — complete boot sequence.
-# Replaces boot/uefi/loader_code.py (391 lines of Python asm generation).
+# Myriad OS UEFI bootloader — Phase 1, EMBED kernel loading.
+# Generic: runs on any 64-bit UEFI machine. No MacBook-specific
+# assumptions. Picks the best available 32bpp GOP mode (largest area,
+# RGB preferred), passes ACTUAL resolution/pitch in the boot-info
+# block, and uses only standard UEFI protocols.
+#
+# Kernel is embedded as a ".kern" PE section (added by the build tool).
+# Loader parses its own PE headers from the image handle, copies the
+# section to 0x400000, builds the boot-info block, exits boot
+# services, and jumps to kmain.
+#
 # Entry: efi_main(image_handle, system_table). Compiled --freestanding.
+# Firmware passes MS x64: RCX=image_handle, RDX=system_table.
+# Orum assumes System V, so both are read explicitly via asm BEFORE
+# any call (calls clobber RCX/RDX).
 
-# Fixed physical addresses (must match docs/boot-contract.md)
-fn k_p_kernel() -> u64
-  return 0x400000
+fn rd16(base: u64, off: u64) -> u64
+mut p: raw *u8 = rawptr(base + off)
+mut lo: u64 = p[0]
+mut hi: u64 = p[1]
+return lo + hi * 256
 end
-fn k_p_lowmem() -> u64
-  return 0x5000
+
+fn rd32(base: u64, off: u64) -> u64
+mut p: raw *u8 = rawptr(base + off)
+mut b0: u64 = p[0]
+mut b1: u64 = p[1]
+mut b2: u64 = p[2]
+mut b3: u64 = p[3]
+return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
 end
-fn k_p_info() -> u64
-  return 0x9000
+
+fn wr8(base: u64, off: u64, val: u64)
+mut p: raw *u8 = rawptr(base + off)
+p[0] = val & 255
 end
-fn k_p_heap() -> u64
-  return 0x2000000
+
+fn wr16(base: u64, off: u64, val: u64)
+mut p: raw *u8 = rawptr(base + off)
+p[0] = val & 255
+p[1] = (val / 256) & 255
+end
+
+fn wr32(base: u64, off: u64, val: u64)
+mut p: raw *u8 = rawptr(base + off)
+p[0] = val & 255
+p[1] = (val / 256) & 255
+p[2] = (val / 65536) & 255
+p[3] = (val / 16777216) & 255
+end
+
+fn wr64(base: u64, off: u64, val: u64)
+mut p: raw *u8 = rawptr(base + off)
+p[0] = val & 255
+p[1] = (val / 256) & 255
+p[2] = (val / 65536) & 255
+p[3] = (val / 16777216) & 255
+p[4] = (val / 4294967296) & 255
+p[5] = (val / 1099511627776) & 255
+p[6] = (val / 281474976710656) & 255
+p[7] = (val / 72057594037927936) & 255
 end
 
 fn uefi_call(fn_ptr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64
-  mut result: u64 = 0
-  asm
-    in fn_ptr = rdi
-    in a1 = rsi
-    in a2 = rdx
-    in a3 = rcx
-    in a4 = r8
-    out result = rax
-    clobber "r9"
-    clobber "r10"
-    clobber "r11"
-    raw 0x4D, 0x89, 0xC1
-    raw 0x49, 0x89, 0xC8
-    raw 0x48, 0x89, 0xF1
-    raw 0x48, 0x83, 0xEC, 0x20
-    raw 0xFF, 0xD7
-    raw 0x48, 0x83, 0xC4, 0x20
-  end
-  return result
+mut result: u64 = 0
+asm
+in fn_ptr = rdi
+in a1 = rsi
+in a2 = rdx
+in a3 = rcx
+in a4 = r8
+out result = rax
+clobber "r9"
+clobber "r10"
+clobber "r11"
+raw 0x4D, 0x89, 0xC1
+raw 0x49, 0x89, 0xC8
+raw 0x48, 0x89, 0xF1
+raw 0x48, 0x83, 0xEC, 0x20
+raw 0xFF, 0xD7
+raw 0x48, 0x83, 0xC4, 0x20
+end
+return result
+end
+
+fn uefi_call5(fn_ptr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
+mut result: u64 = 0
+asm
+in fn_ptr = rdi
+in a1 = rsi
+in a2 = rdx
+in a3 = rcx
+in a4 = r8
+in a5 = r9
+out result = rax
+clobber "r10"
+clobber "r11"
+raw 0x48, 0x83, 0xEC, 0x30
+raw 0x4C, 0x89, 0x4C, 0x24, 0x20
+raw 0x4D, 0x89, 0xC1
+raw 0x49, 0x89, 0xC8
+raw 0x48, 0x89, 0xF1
+raw 0xFF, 0xD7
+raw 0x48, 0x83, 0xC4, 0x30
+end
+return result
+end
+
+# Find on_irq in the copied kernel (at kern_base, length kern_len).
+# Scans for the unique 8-byte NOP marker (0F 1F 84 00 00 00 00 00),
+# backtracks up to 64 bytes to the prologue (55 48 8B EC).
+# Returns the runtime address, or 0 if not found.
+fn find_on_irq(kern_base: u64, kern_len: u64) -> u64
+mut kp: raw *u8 = rawptr(kern_base)
+mut i: u64 = 0
+while i + 8 <= kern_len
+if kp[i] == 0x0F
+if kp[i + 1] == 0x1F
+if kp[i + 2] == 0x84
+if kp[i + 3] == 0
+if kp[i + 4] == 0
+if kp[i + 5] == 0
+if kp[i + 6] == 0
+if kp[i + 7] == 0
+mut j: u64 = 4
+while j <= 64
+if i >= j
+if kp[i - j] == 0x55
+if kp[i - j + 1] == 0x48
+if kp[i - j + 2] == 0x8B
+if kp[i - j + 3] == 0xEC
+return kern_base + i - j
+end
+end
+end
+end
+end
+j = j + 1
+end
+end
+end
+end
+end
+end
+end
+end
+end
+i = i + 1
+end
+return 0
 end
 
 fn efi_main(image_handle: u64, system_table: u64) -> u64
-  mut st: u64 = 0
-  asm
-    out st = rdx
-  end
+mut ih: u64 = 0
+asm
+out ih = rcx
+end
+mut st: u64 = 0
+asm
+out st = rdx
+end
 
-  mut st_ptr: raw *u64 = rawptr(st)
-  mut bs: u64 = st_ptr[12]
+mut st_ptr: raw *u64 = rawptr(st)
+mut bs: u64 = st_ptr[12]
 
-  mut bs_ptr: raw *u64 = rawptr(bs)
-  mut locate: u64 = bs_ptr[40]
-  mut alloc: u64 = bs_ptr[5]
-  mut getmap: u64 = bs_ptr[7]
-  mut ebs: u64 = bs_ptr[29]
+mut bs_ptr: raw *u64 = rawptr(bs)
+mut locate: u64 = bs_ptr[40]
+mut alloc: u64 = bs_ptr[5]
+mut getmap: u64 = bs_ptr[7]
+mut ebs: u64 = bs_ptr[29]
 
-  # GOP GUID: 9042A9DE-23DC-4A38-96FB-7ADDED080516
-  mut guid_d1: u32 = 0x9042A9DE
-  mut guid_addr: u64 = addr(guid_d1)
+mut guid_buf: u64 = 0
+mut guid_buf_addr: u64 = addr(guid_buf)
+mut ga = uefi_call(alloc, 0, 2, 1, guid_buf_addr)
+if ga != 0
+return ga
+end
+wr8(guid_buf, 0, 0xDE)
+wr8(guid_buf, 1, 0xA9)
+wr8(guid_buf, 2, 0x42)
+wr8(guid_buf, 3, 0x90)
+wr8(guid_buf, 4, 0xDC)
+wr8(guid_buf, 5, 0x23)
+wr8(guid_buf, 6, 0x38)
+wr8(guid_buf, 7, 0x4A)
+wr8(guid_buf, 8, 0x96)
+wr8(guid_buf, 9, 0xFB)
+wr8(guid_buf, 10, 0x7A)
+wr8(guid_buf, 11, 0xDD)
+wr8(guid_buf, 12, 0xED)
+wr8(guid_buf, 13, 0x08)
+wr8(guid_buf, 14, 0x05)
+wr8(guid_buf, 15, 0x16)
 
-  mut gop: u64 = 0
-  mut gop_addr: u64 = addr(gop)
-  mut status = uefi_call(locate, guid_addr, 0, gop_addr, 0)
-  if status != 0
-    return status
-  end
+mut gop: u64 = 0
+mut gop_addr: u64 = addr(gop)
+# Fallback framebuffer (QEMU VGA BAR0) — used ONLY if GOP is absent.
+# Real firmware always has GOP; this keeps the pipeline testable under
+# OVMF builds that don't expose it. Overwritten below on GOP success.
+mut fb_base: u64 = 0x80000000
+mut width: u64 = 1024
+mut height: u64 = 768
+mut pitch: u64 = 4096
+mut status = uefi_call(locate, guid_buf, 0, gop_addr, 0)
+if status == 0
+mut gop_ptr: raw *u64 = rawptr(gop)
+mut query: u64 = gop_ptr[0]
+mut setmode: u64 = gop_ptr[1]
+mut mode_ptr: u64 = gop_ptr[3]
+mut mode: raw *u64 = rawptr(mode_ptr)
+mut max_mode: u64 = mode[0] & 4294967295
 
-  mut gop_ptr: raw *u64 = rawptr(gop)
-  mut query: u64 = gop_ptr[0]
-  mut setmode: u64 = gop_ptr[1]
-  mut mode_ptr: u64 = gop_ptr[3]
-  mut mode: raw *u64 = rawptr(mode_ptr)
+mut best_idx: u64 = 0xFFFFFFFF
+mut best_area: u64 = 0
+mut best_fmt: u64 = 0
+mut mi_size: u64 = 0
+mut mi_size_addr: u64 = addr(mi_size)
+mut mi: u64 = 0
+mut mi_addr: u64 = addr(mi)
+mut idx: u64 = 0
+while idx < max_mode
+mut qs = uefi_call(query, gop, idx, mi_size_addr, mi_addr)
+if qs == 0
+mut mip: raw *u32 = rawptr(mi)
+mut w: u64 = mip[1]
+mut h: u64 = mip[2]
+mut fmt: u64 = mip[3]
+if fmt == 0
+if w * h > best_area
+best_area = w * h
+best_idx = idx
+best_fmt = 0
+end
+else
+if fmt == 1
+if w * h > best_area
+best_area = w * h
+best_idx = idx
+best_fmt = 1
+end
+end
+end
+end
+idx = idx + 1
+end
 
-  # Find 1024x768x32 mode
-  mut mode_idx: u64 = 0
-  mut found: u64 = 0xFFFFFFFF
-  mut mi_size: u64 = 0
-  mut mi_size_addr: u64 = addr(mi_size)
-  mut mi: u64 = 0
-  mut mi_addr: u64 = addr(mi)
-  mut idx: u64 = 0
-  mut max_mode: u64 = mode[6]
+if best_idx == 0xFFFFFFFF
+return 0x8000000000000003
+end
 
-  while idx < max_mode
-    mut qs = uefi_call(query, gop, idx, mi_size_addr, mi_addr)
-    if qs == 0
-      mut mip: raw *u32 = rawptr(mi)
-      mut w: u32 = mip[0]
-      mut h: u32 = mip[1]
-      mut fmt: u32 = mip[2]
-      if w == 1024
-        if h == 768
-          if fmt == 0
-            found = idx
-          end
-        end
-      end
-    end
-    idx = idx + 1
-  end
+mut ss = uefi_call(setmode, gop, best_idx, 0, 0)
+if ss != 0
+return ss
+end
 
-  if found == 0xFFFFFFFF
-    return 0x8000000000000003
-  end
+mut mode_ptr2: u64 = gop_ptr[3]
+mut mode2: raw *u64 = rawptr(mode_ptr2)
+fb_base = mode2[3]
+mut info_ptr: u64 = mode2[1]
+mut info32: raw *u32 = rawptr(info_ptr)
+width = info32[1]
+height = info32[2]
+mut ppsl: u64 = info32[8]
+pitch = ppsl * 4
+end
 
-  mut ss = uefi_call(setmode, gop, found, 0, 0)
-  if ss != 0
-    return ss
-  end
+mut kp: u64 = 0x400000
+mut kp_addr: u64 = addr(kp)
+mut as_ = uefi_call(alloc, 2, 2, 256, kp_addr)
+if as_ != 0
+return as_
+end
 
-  # Get framebuffer base after SetMode
-  mut mode_ptr2: u64 = gop_ptr[3]
-  mut mode2: raw *u64 = rawptr(mode_ptr2)
-  mut fb_base: u64 = mode2[0]
-  mut fb_size: u64 = mode2[1]
+# NOTE: ih is an opaque HANDLE, not the image address. The PE is loaded
+# at its ImageBase (0x200000, set by pe.orum) because it has no
+# relocations — OVMF must load there or fail. Parse from 0x200000.
+mut img_base: u64 = 0x200000
+mut mz0: raw *u8 = rawptr(img_base)
+if mz0[0] != 0x4D
+return 0x8000000000000006
+end
+if mz0[1] != 0x5A
+return 0x8000000000000006
+end
+mut pe_off: u64 = rd32(img_base, 60)
+mut pe: u64 = img_base + pe_off
+mut num_sect: u64 = rd16(pe, 6)
+mut opt_size: u64 = rd16(pe, 20)
+mut sect_table: u64 = pe + 24 + opt_size
+mut kern_rva: u64 = 0
+mut kern_size: u64 = 0
+mut found_kern: u64 = 0
+mut si: u64 = 0
+while si < num_sect
+mut s: u64 = sect_table + si * 40
+mut sp: raw *u8 = rawptr(s)
+if sp[0] == 46
+if sp[1] == 107
+if sp[2] == 101
+if sp[3] == 114
+if sp[4] == 110
+kern_rva = rd32(s, 12)
+kern_size = rd32(s, 8)
+found_kern = 1
+end
+end
+end
+end
+end
+si = si + 1
+end
 
-  # Allocate pages for kernel at fixed address
-  mut kp: u64 = k_p_kernel()
-  mut kp_addr: u64 = addr(kp)
-  mut pages: u64 = 256
-  mut as_ = uefi_call(alloc, 1, 7, pages, kp_addr)
-  if as_ != 0
-    return as_
-  end
+if found_kern == 0
+return 0x8000000000000002
+end
 
-  # TODO: copy kernel from PE to kp, build info block,
-  # GetMemoryMap, ExitBootServices, jump to kernel.
-  # For now, spin with framebuffer filled green = SetMode worked.
+mut src: raw *u8 = rawptr(img_base + kern_rva)
+mut dst: raw *u8 = rawptr(0x400000)
+mut ci: u64 = 0
+while ci < kern_size
+dst[ci] = src[ci]
+ci = ci + 1
+end
 
-  mut fb: raw *u32 = rawptr(fb_base)
-  mut i: u64 = 0
-  while i < 1024 * 768
-    fb[i] = 0x0000FF00
-    i = i + 1
-  end
+# --- lowmem: find .lowmem section, copy to 0x6000 ---
+mut lowmem_rva: u64 = 0
+mut lowmem_size: u64 = 0
+mut found_lowmem: u64 = 0
+mut si2: u64 = 0
+while si2 < num_sect
+mut s2: u64 = sect_table + si2 * 40
+mut sp2: raw *u8 = rawptr(s2)
+if sp2[0] == 46
+if sp2[1] == 108
+if sp2[2] == 111
+if sp2[3] == 119
+if sp2[4] == 109
+if sp2[5] == 101
+if sp2[6] == 109
+lowmem_rva = rd32(s2, 12)
+lowmem_size = rd32(s2, 8)
+found_lowmem = 1
+end
+end
+end
+end
+end
+end
+end
+si2 = si2 + 1
+end
+if found_lowmem == 0
+return 0x8000000000000004
+end
+mut lsrc: raw *u8 = rawptr(img_base + lowmem_rva)
+mut ldst: raw *u8 = rawptr(0x6000)
+mut li: u64 = 0
+while li < lowmem_size
+ldst[li] = lsrc[li]
+li = li + 1
+end
+# --- zero IDT area 0x5000 (kernel builds it, start clean) ---
+mut zdst: raw *u8 = rawptr(0x5000)
+mut zi: u64 = 0
+while zi < 4096
+zdst[zi] = 0
+zi = zi + 1
+end
+# --- on_irq: scan copied kernel, patch handler at 0x7000+37 ---
+mut on_irq: u64 = find_on_irq(0x400000, kern_size)
+if on_irq == 0
+return 0x8000000000000005
+end
+wr64(0x7000, 37, on_irq)
+wr32(0x9000, 0, 48)
+wr32(0x9000, 4, 0)
+wr16(0x9000, 8, 8)
+wr16(0x9000, 10, 0)
+wr32(0x9000, 12, 32)
+wr64(0x9000, 16, fb_base)
+wr32(0x9000, 24, pitch)
+wr32(0x9000, 28, width)
+wr32(0x9000, 32, height)
+wr8(0x9000, 36, 32)
+wr8(0x9000, 37, 1)
+wr16(0x9000, 38, 0)
+wr16(0x9000, 40, 0)
+wr16(0x9000, 42, 0)
+wr32(0x9000, 44, 8)
 
-  while 1 > 0
-  end
-  return 0
+mut map_buf: u64 = 0
+mut map_buf_addr: u64 = addr(map_buf)
+# Reserve the kernel heap region 0x2000000-0x3000000 (16MB, LoaderData)
+# so firmware won't hand it out after ExitBootServices.
+mut heap_base: u64 = 0x2000000
+mut heap_base_addr: u64 = addr(heap_base)
+mut ha = uefi_call(alloc, 2, 2, 4096, heap_base_addr)
+if ha != 0
+return ha
+end
+mut ma = uefi_call(alloc, 0, 2, 32, map_buf_addr)
+if ma != 0
+return ma
+end
+
+mut map_size: u64 = 131072
+mut map_size_addr: u64 = addr(map_size)
+mut map_key: u64 = 0
+mut map_key_addr: u64 = addr(map_key)
+mut desc_size: u64 = 0
+mut desc_size_addr: u64 = addr(desc_size)
+mut desc_ver: u64 = 0
+mut desc_ver_addr: u64 = addr(desc_ver)
+
+mut gm = uefi_call5(getmap, map_size_addr, map_buf, map_key_addr, desc_size_addr, desc_ver_addr)
+if gm != 0
+return gm
+end
+
+mut tries: u64 = 0
+mut ebs_status: u64 = 1
+while tries < 5
+ebs_status = uefi_call(ebs, ih, map_key, 0, 0)
+if ebs_status == 0
+tries = 5
+else
+gm = uefi_call5(getmap, map_size_addr, map_buf, map_key_addr, desc_size_addr, desc_ver_addr)
+if gm != 0
+return gm
+end
+tries = tries + 1
+end
+end
+
+if ebs_status != 0
+return ebs_status
+end
+
+mut kern_entry_ptr: raw *u64 = rawptr(0x400018)
+mut kern_entry: u64 = kern_entry_ptr[0]
+
+asm
+in kern_entry = r10
+raw 0x48, 0x83, 0xEC, 0x08
+raw 0x48, 0xC7, 0xC7, 0x00, 0x90, 0x00, 0x00
+raw 0x4C, 0x89, 0xD0
+raw 0xFF, 0xE0
+end
+return 0
 end

@@ -1,0 +1,87 @@
+# common.orum — shared declarations for Menagerie hosted build tools.
+#
+# Declarations ONLY: no top-level statements, so this file is safe to
+# `take` from any tool. The little-endian buffer primitives and the
+# file reader used by pe.orum, fat.orum (and anything that takes them).
+# Hosted only (uses fopen/fread/fclose/fseek/heap_alloc).
+
+fn align_up(n: u64, a: u64) -> u64
+return (n + a - 1) / a * a
+end
+
+fn rd16(buf: raw *u8, off: u64) -> u64
+return buf[off] | (buf[off + 1] << 8)
+end
+
+fn rd32(buf: raw *u8, off: u64) -> u64
+return buf[off] | (buf[off + 1] << 8) | (buf[off + 2] << 16) | (buf[off + 3] << 24)
+end
+
+fn rd64(buf: raw *u8, off: u64) -> u64
+return buf[off] | (buf[off + 1] << 8) | (buf[off + 2] << 16) | (buf[off + 3] << 24) | (buf[off + 4] << 32) | (buf[off + 5] << 40) | (buf[off + 6] << 48) | (buf[off + 7] << 56)
+end
+
+fn wr16(buf: raw *u8, off: u64, v: u64)
+buf[off] = v & 0xFF
+buf[off + 1] = (v >> 8) & 0xFF
+end
+
+fn wr32(buf: raw *u8, off: u64, v: u64)
+buf[off] = v & 0xFF
+buf[off + 1] = (v >> 8) & 0xFF
+buf[off + 2] = (v >> 16) & 0xFF
+buf[off + 3] = (v >> 24) & 0xFF
+end
+
+fn wr64(buf: raw *u8, off: u64, v: u64)
+buf[off] = v & 0xFF
+buf[off + 1] = (v >> 8) & 0xFF
+buf[off + 2] = (v >> 16) & 0xFF
+buf[off + 3] = (v >> 24) & 0xFF
+buf[off + 4] = (v >> 32) & 0xFF
+buf[off + 5] = (v >> 40) & 0xFF
+buf[off + 6] = (v >> 48) & 0xFF
+buf[off + 7] = (v >> 56) & 0xFF
+end
+
+fn zero_fill(buf: raw *u8, off: u64, n: u64)
+mut i: u64 = 0
+while i < n
+buf[off + i] = 0
+i = i + 1
+end
+end
+
+fn copy_bytes(dst: raw *u8, dst_off: u64, src: raw *u8, src_off: u64, n: u64)
+mut i: u64 = 0
+while i < n
+dst[dst_off + i] = src[src_off + i]
+i = i + 1
+end
+end
+
+# Read a whole file into a heap buffer. Sets out_len[0] to the size.
+# A missing file is NOT an error: out_len[0] = 0 and the null pointer
+# is returned (callers must not touch the buffer when the length is 0).
+fn read_all(path: str, out_len: raw *u64) -> raw *u8
+fd: int = fopen(path, "r")
+if fd < 0
+out_len[0] = 0
+nullp: raw *u8 = rawptr(0)
+return nullp
+end
+size: u64 = fseek(fd, 0, 2)
+fseek(fd, 0, 0)
+buf: raw *u8 = heap_alloc(size)
+mut got: u64 = 0
+while got < size
+n: int = fread(fd, buf + got, size - got)
+if n <= 0
+crash "short read"
+end
+got = got + n
+end
+fclose(fd)
+out_len[0] = size
+return buf
+end

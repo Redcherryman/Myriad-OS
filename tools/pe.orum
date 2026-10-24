@@ -1,0 +1,367 @@
+# pe.orum — hosted Orum PE32+ writer (Myriad build tool).
+#
+# Builds the UEFI loader PE from two Orum ELFs + the lowmem blob
+# (EMBED design, Oct 24):
+#   boot ELF — the bootloader (compiled freestanding, entry efi_main)
+#   kern ELF — the kernel (compiled freestanding, entry kmain)
+#   lowmem bin — the kernel's low-memory environment (tools/lowmem.orum)
+# Writes a PE32+ image with three sections:
+#   .text — bootloader code (ELF headers stripped, starts at code)
+#   .kern — kernel FULL first segment (headers INCLUDED, so the loader
+#           can read the kernel's e_entry from the copied header and
+#           jump to it — no patching, no hardcoded kernel entry).
+#   .lowmem — lowmem blob (flat, copied by the loader to 0x6000).
+#
+# Layout: ImageBase 0x200000 (loader runs here, kernel goes to
+# 0x400000 — no overlap). .text RVA 0x1000, .kern after it, .lowmem
+# after that, all SectionAlignment 0x1000, FileAlignment 0x200.
+# EntryPoint = .text RVA + bootloader entry offset within its code.
+#
+# The main flow lives in pe_build() so build.orum can take this module
+# and call it; the top-level call below preserves the standalone
+# fixed-path behavior.
+
+take common from common
+
+IMAGE_BASE = 0x200000
+SECT_ALIGN = 0x1000
+FILE_ALIGN = 0x200
+
+# orum/elf.py ABI constants
+TEXT_OFF = 192
+VBASE = 0x400000
+
+IN_ELF = "in.elf"
+IN_KERN = "in_kern.elf"
+IN_LOWMEM = "lowmem.bin"
+OUT_EFI = "out.efi"
+
+# --- ELF parsing ---
+
+# Locate the first PT_LOAD segment; sets out_off[0]/out_size[0] to its
+# file offset and size. Crashes if there is none.
+fn find_load_seg(elf: raw *u8, out_off: raw *u64, out_size: raw *u64)
+e_phoff: u64 = rd64(elf, 0x20)
+e_phentsize: u64 = rd16(elf, 0x36)
+e_phnum: u64 = rd16(elf, 0x38)
+mut i: u64 = 0
+while i < e_phnum
+p: u64 = e_phoff + i * e_phentsize
+if rd32(elf, p) == 1
+out_off[0] = rd64(elf, p + 8)
+out_size[0] = rd64(elf, p + 32)
+return
+end
+i = i + 1
+end
+crash "no PT_LOAD segment in input ELF"
+end
+
+# --- heap relocation patching (mirrors mkcustom.py apply_heap_relocs) ---
+#
+# The freestanding kernel leaves __orum_heap_start/__orum_heap_end as
+# UND externs with R_X86_64_64 relocations in .rela.text. The BIOS build
+# patched them to 0x2000000/0x3000000; the UEFI PE must carry the same
+# patch, or the kernel's heap is dead (heap_selftest fails -> halt).
+# Patches the kernel blob IN PLACE (blob offset = r_offset - 0x400000).
+# Crashes if no heap relocs are found (a silent no-patch is worse).
+
+fn patch_heap_relocs(elf: raw *u8, blob: raw *u8, blob_len: u64)
+mut e_shoff: u64 = rd64(elf, 0x28)
+mut e_shentsize: u64 = rd16(elf, 0x3A)
+mut e_shnum: u64 = rd16(elf, 0x3C)
+mut symtab_off: u64 = 0
+mut symtab_size: u64 = 0
+mut symtab_entsize: u64 = 0
+mut symtab_link: u64 = 0
+mut rela_off: u64 = 0
+mut rela_size: u64 = 0
+mut rela_entsize: u64 = 0
+mut rela_found: u64 = 0
+mut si: u64 = 0
+while si < e_shnum
+mut sh: u64 = e_shoff + si * e_shentsize
+mut sh_type: u64 = rd32(elf, sh + 4)
+if sh_type == 2
+symtab_off = rd64(elf, sh + 24)
+symtab_size = rd64(elf, sh + 32)
+symtab_link = rd32(elf, sh + 40)
+symtab_entsize = rd64(elf, sh + 56)
+end
+if sh_type == 4
+rela_off = rd64(elf, sh + 24)
+rela_size = rd64(elf, sh + 32)
+rela_entsize = rd64(elf, sh + 56)
+rela_found = 1
+end
+si = si + 1
+end
+if rela_found == 0
+crash "no .rela.text in kernel ELF"
+end
+if symtab_off == 0
+crash "no .symtab in kernel ELF"
+end
+# Strtab header via symtab sh_link
+mut str_sh: u64 = e_shoff + symtab_link * e_shentsize
+mut str_off: u64 = rd64(elf, str_sh + 24)
+mut patched: u64 = 0
+mut ri: u64 = 0
+mut nrela: u64 = rela_size / rela_entsize
+while ri < nrela
+mut re: u64 = rela_off + ri * rela_entsize
+mut r_offset: u64 = rd64(elf, re)
+mut r_info: u64 = rd64(elf, re + 8)
+mut r_addend: u64 = rd64(elf, re + 16)
+mut r_type: u64 = r_info & 4294967295
+mut r_sym: u64 = r_info / 4294967296
+if r_type != 1
+crash "unexpected reloc type in kernel ELF"
+end
+# Symbol name: st_name at symtab + r_sym * entsize
+mut sym: u64 = symtab_off + r_sym * symtab_entsize
+mut st_name: u64 = rd32(elf, sym)
+mut np: raw *u8 = elf + str_off + st_name
+# Compare against "__orum_heap_start" (17 chars) / "__orum_heap_end" (15)
+mut is_start: u64 = 1
+mut is_end: u64 = 1
+mut hs: raw *u8 = [
+0x5F, 0x5F, 0x6F, 0x72, 0x75, 0x6D, 0x5F, 0x68, 0x65, 0x61, 0x70, 0x5F, 0x73, 0x74, 0x61, 0x72, 0x74
+]
+mut he: raw *u8 = [
+0x5F, 0x5F, 0x6F, 0x72, 0x75, 0x6D, 0x5F, 0x68, 0x65, 0x61, 0x70, 0x5F, 0x65, 0x6E, 0x64
+]
+mut ci: u64 = 0
+while ci < 17
+if np[ci] != hs[ci]
+is_start = 0
+end
+ci = ci + 1
+end
+if np[17] != 0
+is_start = 0
+end
+ci = 0
+while ci < 15
+if np[ci] != he[ci]
+is_end = 0
+end
+ci = ci + 1
+end
+if np[15] != 0
+is_end = 0
+end
+if is_start == 1
+mut foff: u64 = r_offset - 0x400000
+if foff + 8 > blob_len
+crash "heap_start reloc outside kernel blob"
+end
+wr64(blob, foff, 0x2000000 + r_addend)
+patched = patched + 1
+end
+if is_end == 1
+mut foff2: u64 = r_offset - 0x400000
+if foff2 + 8 > blob_len
+crash "heap_end reloc outside kernel blob"
+end
+wr64(blob, foff2, 0x3000000 + r_addend)
+patched = patched + 1
+end
+ri = ri + 1
+end
+if patched == 0
+crash "no heap relocations found — heap would be dead"
+end
+end
+
+# --- main flow: build the PE32+ image ---
+#
+# NOTE: module constants (IMAGE_BASE etc.) are NOT visible inside fn
+# bodies, so the numeric values appear as literals below — they mirror
+# the constants above: IMAGE_BASE=0x200000, SECT_ALIGN=0x1000,
+# FILE_ALIGN=0x200, TEXT_OFF=192, VBASE=0x400000.
+
+fn pe_build(elf_path: str, kern_path: str, lowmem_path: str, efi_path: str)
+mut elf_len: u64 = 0
+elf_lenp: raw *u64 = rawptr(addr(elf_len))
+elf: raw *u8 = read_all(elf_path, elf_lenp)
+if elf_len == 0
+crash "cannot open boot elf input (or it is empty)"
+end
+
+# Boot code blob = first PT_LOAD, starting at TEXT_OFF (192)
+mut seg_off: u64 = 0
+mut seg_len: u64 = 0
+seg_offp: raw *u64 = rawptr(addr(seg_off))
+seg_lenp: raw *u64 = rawptr(addr(seg_len))
+find_load_seg(elf, seg_offp, seg_lenp)
+if seg_len < 192
+crash "PT_LOAD smaller than TEXT_OFF"
+end
+text_off: u64 = seg_off + 192
+text_len: u64 = seg_len - 192
+text: raw *u8 = elf + text_off
+
+# entry offset within the blob, from e_entry (VBASE=0x400000)
+e_entry: u64 = rd64(elf, 0x18)
+if e_entry < 0x400000 + 192
+crash "e_entry below code start"
+end
+entry_off: u64 = e_entry - 0x400000 - 192
+if entry_off >= text_len
+crash "e_entry outside code blob"
+end
+
+# Kernel blob = FULL first PT_LOAD segment (headers included).
+mut kern_len: u64 = 0
+kern_lenp: raw *u64 = rawptr(addr(kern_len))
+kern_elf: raw *u8 = read_all(kern_path, kern_lenp)
+if kern_len == 0
+crash "cannot open kern elf input (or it is empty)"
+end
+mut kseg_off: u64 = 0
+mut kseg_len: u64 = 0
+kseg_offp: raw *u64 = rawptr(addr(kseg_off))
+kseg_lenp: raw *u64 = rawptr(addr(kseg_len))
+find_load_seg(kern_elf, kseg_offp, kseg_lenp)
+kern: raw *u8 = kern_elf + kseg_off
+kern_blob_len: u64 = kseg_len
+
+# Resolve the kernel's heap relocs in the blob before embedding.
+patch_heap_relocs(kern_elf, kern, kern_blob_len)
+
+# Lowmem blob = flat file, copied verbatim (no ELF parsing).
+mut lowmem_len: u64 = 0
+lowmem_lenp: raw *u64 = rawptr(addr(lowmem_len))
+lowmem: raw *u8 = read_all(lowmem_path, lowmem_lenp)
+if lowmem_len == 0
+crash "cannot open lowmem input (or it is empty)"
+end
+
+# Section RVAs (SECT_ALIGN=0x1000)
+text_rva: u64 = 0x1000
+kern_rva: u64 = text_rva + align_up(text_len, 0x1000)
+lowmem_rva: u64 = kern_rva + align_up(kern_blob_len, 0x1000)
+
+size_image: u64 = align_up(lowmem_rva + lowmem_len, 0x1000)
+size_headers: u64 = 0x200
+text_raw_len: u64 = align_up(text_len, 0x200)
+kern_raw_len: u64 = align_up(kern_blob_len, 0x200)
+lowmem_raw_len: u64 = align_up(lowmem_len, 0x200)
+total: u64 = size_headers + text_raw_len + kern_raw_len + lowmem_raw_len
+
+# The whole output starts zeroed, so padding and header slack are
+# already correct; only headers + blobs are written.
+img: raw *u8 = heap_alloc(total)
+zero_fill(img, 0, total)
+
+# DOS header
+img[0] = 0x4D
+img[1] = 0x5A
+wr32(img, 0x3C, 0x40)
+
+# PE signature
+img[0x40] = 0x50
+img[0x41] = 0x45
+img[0x42] = 0
+img[0x43] = 0
+
+# COFF header: x86-64, 3 sections, no symbols, 0xF0 optional header
+wr16(img, 0x44, 0x8664)
+wr16(img, 0x46, 3)
+wr32(img, 0x48, 0)
+wr32(img, 0x4C, 0)
+wr32(img, 0x50, 0)
+wr16(img, 0x54, 0xF0)
+wr16(img, 0x56, 0x0022)
+
+# Optional header (PE32+), at 0x58
+oh: u64 = 0x58
+wr16(img, oh, 0x020B)
+wr32(img, oh + 4, text_raw_len)
+wr32(img, oh + 8, kern_raw_len + lowmem_raw_len)
+wr32(img, oh + 12, 0)
+wr32(img, oh + 16, text_rva + entry_off)
+wr32(img, oh + 20, text_rva)
+wr64(img, oh + 24, 0x200000)
+wr32(img, oh + 32, 0x1000)
+wr32(img, oh + 36, 0x200)
+wr32(img, oh + 56, size_image)
+wr32(img, oh + 60, size_headers)
+wr16(img, oh + 68, 10)
+wr64(img, oh + 72, 0x100000)
+wr64(img, oh + 80, 0x10000)
+wr64(img, oh + 88, 0x100000)
+wr64(img, oh + 96, 0x1000)
+wr32(img, oh + 108, 16)
+
+# Section headers at 0x148 (.text), 0x170 (.kern), 0x198 (.lowmem)
+mut sh: u64 = 0x148
+img[sh] = 0x2E
+img[sh + 1] = 0x74
+img[sh + 2] = 0x65
+img[sh + 3] = 0x78
+img[sh + 4] = 0x74
+img[sh + 5] = 0
+img[sh + 6] = 0
+img[sh + 7] = 0
+wr32(img, sh + 8, text_len)
+wr32(img, sh + 12, text_rva)
+wr32(img, sh + 16, text_raw_len)
+wr32(img, sh + 20, size_headers)
+wr32(img, sh + 36, 0x60000020)
+
+sh = 0x170
+img[sh] = 0x2E
+img[sh + 1] = 0x6B
+img[sh + 2] = 0x65
+img[sh + 3] = 0x72
+img[sh + 4] = 0x6E
+img[sh + 5] = 0
+img[sh + 6] = 0
+img[sh + 7] = 0
+wr32(img, sh + 8, kern_blob_len)
+wr32(img, sh + 12, kern_rva)
+wr32(img, sh + 16, kern_raw_len)
+wr32(img, sh + 20, size_headers + text_raw_len)
+wr32(img, sh + 36, 0x40000040)
+
+sh = 0x198
+img[sh] = 0x2E
+img[sh + 1] = 0x6C
+img[sh + 2] = 0x6F
+img[sh + 3] = 0x77
+img[sh + 4] = 0x6D
+img[sh + 5] = 0x65
+img[sh + 6] = 0x6D
+img[sh + 7] = 0
+wr32(img, sh + 8, lowmem_len)
+wr32(img, sh + 12, lowmem_rva)
+wr32(img, sh + 16, lowmem_raw_len)
+wr32(img, sh + 20, size_headers + text_raw_len + kern_raw_len)
+wr32(img, sh + 36, 0x40000040)
+
+# Blobs at their file offsets
+copy_bytes(img, size_headers, text, 0, text_len)
+copy_bytes(img, size_headers + text_raw_len, kern, 0, kern_blob_len)
+copy_bytes(img, size_headers + text_raw_len + kern_raw_len, lowmem, 0, lowmem_len)
+
+ofd: int = fopen(efi_path, "w")
+if ofd < 0
+crash "cannot open efi output for writing"
+end
+mut wrote: u64 = 0
+while wrote < total
+n: int = fwrite(ofd, img + wrote, total - wrote)
+if n <= 0
+crash "short write to efi output"
+end
+wrote = wrote + n
+end
+fclose(ofd)
+
+say(total)
+end
+
+# Standalone entry: fixed paths (unchanged behavior).
+pe_build(IN_ELF, IN_KERN, IN_LOWMEM, OUT_EFI)
